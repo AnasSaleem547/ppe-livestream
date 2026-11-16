@@ -22,10 +22,11 @@ def crop_for(settings, body):
 
 
 def prepare_detector(settings, body):
+    import torch
     runner = PipelineRunner(settings)
     runner._prepare_detector(crop_for(settings, body), body['width'], body['height'])
-    if settings.device == 'cuda' and runner.detector.device != 'cuda':
-        raise RuntimeError('GPU warmup failed.')
+    if (settings.device == 'cuda' or (settings.device == 'auto' and torch.cuda.is_available())) and runner.detector.device != 'cuda':
+        raise RuntimeError('GPU warmup ran out of memory. Free GPU memory before restarting live monitoring.')
     return runner.detector
 
 
