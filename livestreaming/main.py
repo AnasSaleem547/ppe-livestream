@@ -1,5 +1,6 @@
 """One configured camera, one monitoring session, one API process."""
 import logging
+import queue
 import sqlite3
 import threading
 import time
@@ -42,7 +43,7 @@ class ViewChanged(Exception):
     pass
 
 
-def camera_frames(settings):
+def decoded_camera_frames(settings):
     url = settings.live_camera_url.get_secret_value()
     if not url:
         raise CameraInterrupted('Configure LIVE_CAMERA_URL on the live backend.')
@@ -74,6 +75,50 @@ def camera_frames(settings):
                 raise CameraInterrupted('Camera startup ended without a usable frame.')
     except (av.FFmpegError, OSError, IndexError):
         raise CameraInterrupted('Camera connection interrupted.') from None
+
+
+def camera_frames(settings):
+    """Drain camera decoding independently; inference always takes the newest frame."""
+    pending = queue.Queue(maxsize=1)
+    stopped = threading.Event()
+
+    def publish(item):
+        while not stopped.is_set():
+            try:
+                pending.put_nowait(item)
+                return
+            except queue.Full:
+                try:
+                    pending.get_nowait()
+                except queue.Empty:
+                    pass
+
+    def read():
+        try:
+            with closing(decoded_camera_frames(settings)) as source:
+                for frame in source:
+                    if stopped.is_set():
+                        break
+                    publish(frame)
+        except Exception as exc:
+            publish(exc)
+        else:
+            publish(CameraInterrupted('Camera stream ended. Reconnecting.'))
+
+    reader = threading.Thread(target=read, name='camera-reader', daemon=True)
+    reader.start()
+    try:
+        while True:
+            try:
+                item = pending.get(timeout=12)
+            except queue.Empty:
+                raise CameraInterrupted('Camera reader timed out.') from None
+            if isinstance(item, Exception):
+                raise item
+            yield item
+    finally:
+        stopped.set()
+        reader.join(timeout=6)
 
 
 def jpeg(image):
@@ -130,6 +175,8 @@ class Monitor:
                     return
                 self.update(state='starting', message='Preparing detector.')
                 detector = self.detector_factory() if self.detector_factory else prepare_detector(self.settings, body)
+                self.update(device=getattr(detector, 'device', 'unknown'))
+                log.info('Live detector ready on %s', getattr(detector, 'device', 'unknown'))
                 session = uuid.uuid4().hex
                 while not self.cancel.is_set():
                     try:
@@ -176,7 +223,8 @@ class Monitor:
                         self.save_event(session, alarm_time, alarm_start, float(t), last_active, 'count_below_threshold')
                         last_active = None
                     self.update(**result, frame=image_data_uri(picture), state='running',
-                                updated=time.time(), message='Monitoring.')
+                                updated=time.time(), message='Monitoring.',
+                                processing_delay_seconds=max(0, time.monotonic() - started - float(t)))
                 if not self.cancel.is_set():
                     raise CameraInterrupted('Camera stream ended. Reconnecting.')
         finally:

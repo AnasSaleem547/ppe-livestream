@@ -7,21 +7,32 @@ and video worker:
 
     python -m uvicorn livestreaming.main:app --host 127.0.0.1 --port 8011
 
-Use one live API process. Both backends must run on the same Linux host and
+Use one live API process. Both backends must run on the same host and
 use the same local `DATA_DIR` so their processing locks work. Restart the
 updated video worker before using live mode. The frontend uses
 `LIVE_BACKEND_URL` (default http://127.0.0.1:8011).
 
-The repository environment pins CPU PyTorch. On the GPU host, install matching
-CUDA-enabled PyTorch and torchvision builds compatible with the GPU driver in
-the live service's environment. Run this with that environment's Python:
+Create and activate the environment:
+
+    conda env create -f environment.yml
+    conda activate ppe-monitor
+
+The environment installs CUDA 12.8-capable PyTorch and torchvision directly;
+there is no additional setup script. On Windows/Linux NVIDIA machines with a
+compatible driver, `DEVICE=auto` (the default) selects CUDA. Without an available
+CUDA GPU it selects CPU using the same installation. `DEVICE=cpu` explicitly
+disables GPU use. Check with that environment's Python:
 
     python -c "import torch; print(torch.cuda.is_available())"
 
-Check that it prints True and set `DEVICE=cuda` for the live API process.
+On an NVIDIA machine, check that it prints True.
 Verify camera-to-screen delay on that host. The reader tracks accumulated
 processing delay relative to the stream clock, which excludes any delay
-already present when the first camera picture arrives.
+already present when the first camera picture arrives. Camera decoding runs
+independently with a single latest-frame slot, so slower inference skips stale
+frames rather than accumulating a queue. Timestamp gaps above the configured
+continuity limit still reset tracking and alarms. `/status` exposes the selected
+device and measured processing delay.
 
 Choose **Live camera**, get the preview, mark four corners, set the people
 count and duration, and press **Start monitoring**. Enable sound in the

@@ -10,3 +10,7 @@ data/
 test-results/
 playwright-report/
 models/
+tests/
+.test-tmp*/
+.runlogs/
+.integration/
