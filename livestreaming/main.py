@@ -50,10 +50,28 @@ def camera_frames(settings):
         with av.open(url, options={'rtsp_transport': 'tcp'}, timeout=(5, 5)) as source:
             stream = source.streams.video[0]
             fps = float(stream.average_rate or VIDEO_FALLBACK_FPS)
-            for frame in source.decode(stream):
-                if frame.pts is None or frame.is_corrupt:
-                    raise CameraInterrupted('Camera returned an unusable frame.')
-                yield frame.to_ndarray(format='bgr24'), frame.pts * frame.time_base, fps
+            # Joining an HEVC stream can precede its first usable reference
+            # picture. Keep the decoder connected long enough to recover.
+            deadline = time.monotonic() + 5
+            started = False
+            for packet in source.demux(stream):
+                if not started and time.monotonic() >= deadline:
+                    raise CameraInterrupted('Camera startup timed out waiting for a usable frame.')
+                try:
+                    frames = packet.decode()
+                except av.InvalidDataError:
+                    if started:
+                        raise CameraInterrupted('Camera decoding interrupted. Restarting tracking.') from None
+                    continue
+                for frame in frames:
+                    if frame.pts is None or frame.is_corrupt:
+                        if started:
+                            raise CameraInterrupted('Camera returned an unusable frame. Restarting tracking.')
+                        continue
+                    started = True
+                    yield frame.to_ndarray(format='bgr24'), frame.pts * frame.time_base, fps
+            if not started:
+                raise CameraInterrupted('Camera startup ended without a usable frame.')
     except (av.FFmpegError, OSError, IndexError):
         raise CameraInterrupted('Camera connection interrupted.') from None
 

@@ -151,3 +151,57 @@ def test_live_waits_for_current_video_and_can_cancel_without_camera(tmp_path):
                 time.sleep(.01)
             assert api.get('/status').json()['state'] == 'stopped'
     frames.assert_not_called()
+
+
+def camera_frame(pts=1, corrupt=False):
+    from types import SimpleNamespace
+    return SimpleNamespace(pts=pts, time_base=Fraction(1, 25), is_corrupt=corrupt,
+                           to_ndarray=lambda **kwargs: np.zeros((120, 120, 3), np.uint8))
+
+
+def packet_source(monkeypatch, frames):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    import livestreaming.main as live
+    packets = []
+    for frame in frames:
+        packet = Mock()
+        if isinstance(frame, Exception):
+            packet.decode.side_effect = frame
+        else:
+            packet.decode.return_value = [frame]
+        packets.append(packet)
+    source = MagicMock()
+    source.__enter__.return_value = source
+    source.streams.video = [SimpleNamespace(average_rate=25)]
+    source.demux.return_value = iter(packets)
+    # Represent the current decode iterator as well so the original bug is exercised.
+    source.decode.return_value = iter(f for f in frames if not isinstance(f, Exception))
+    monkeypatch.setattr(live.av, 'open', lambda *args, **kwargs: source)
+    return live
+
+
+def test_camera_recovers_initial_missing_timestamp_and_corrupt_frames(monkeypatch):
+    live = packet_source(monkeypatch, [camera_frame(None), camera_frame(1, True),
+                                     av.InvalidDataError(1094995529, 'invalid startup packet'),
+                                     camera_frame(2), camera_frame(3)])
+    settings = live.LiveSettings(live_camera_url='rtsp://example.test/camera')
+    results = list(live.camera_frames(settings))
+    assert [t for _, t, _ in results] == [Fraction(2, 25), Fraction(3, 25)]
+
+
+def test_camera_startup_recovery_has_deadline(monkeypatch):
+    live = packet_source(monkeypatch, [camera_frame(None), camera_frame(None)])
+    monkeypatch.setattr(live.time, 'monotonic', Mock(side_effect=[0, 0, 6]))
+    import pytest
+    with pytest.raises(live.CameraInterrupted, match='startup'):
+        list(live.camera_frames(live.LiveSettings(live_camera_url='rtsp://example.test/camera')))
+
+
+def test_camera_invalid_frame_after_start_interrupts_continuity(monkeypatch):
+    live = packet_source(monkeypatch, [camera_frame(1), camera_frame(None), camera_frame(3)])
+    source = live.camera_frames(live.LiveSettings(live_camera_url='rtsp://example.test/camera'))
+    assert next(source)[1] == Fraction(1, 25)
+    import pytest
+    with pytest.raises(live.CameraInterrupted):
+        next(source)
